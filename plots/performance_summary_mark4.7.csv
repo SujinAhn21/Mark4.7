@@ -1,0 +1,11 @@
+# Performance Summary for mark4.7
+
+Metric,Score
+Accuracy,1.0
+ROC AUC,1.0
+
+# Class-wise Metrics
+
+Class,Precision,Recall,F1-Score
+water_shower,1.0,1.0,1.0
+others,1.0,1.0,1.0
