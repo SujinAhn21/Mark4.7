@@ -2,7 +2,6 @@
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 class ViLDHead(nn.Module):
     """
@@ -23,4 +22,26 @@ class ViLDHead(nn.Module):
         x = self.norm(x)
         x = self.activation(x)
         return x  # 정규화 제거됨
+
+
+class DualBranchStudentHead(nn.Module):
+    """Separates supervised and distillation projections for student training."""
+
+    def __init__(self, embedding_dim):
+        super().__init__()
+        self.supervised_branch = nn.Sequential(
+            nn.Linear(embedding_dim, embedding_dim),
+            nn.LayerNorm(embedding_dim),
+            nn.ReLU(inplace=True),
+        )
+        self.distill_branch = nn.Sequential(
+            nn.Linear(embedding_dim, embedding_dim),
+            nn.LayerNorm(embedding_dim),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, features):
+        supervised_features = self.supervised_branch(features)
+        distill_features = self.distill_branch(features)
+        return supervised_features, distill_features
     

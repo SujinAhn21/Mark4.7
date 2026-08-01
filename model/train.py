@@ -22,7 +22,7 @@ import sys
 
 # 경로 정합성
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))            # model/
-PROJECT_ROOT = os.path.dirname(BASE_DIR)                         # mark4.7/
+PROJECT_ROOT = os.path.dirname(BASE_DIR)                         # mark4.1/
 UTILS_DIR = os.path.join(PROJECT_ROOT, "utils")
 for p in (PROJECT_ROOT, UTILS_DIR):
     if p not in sys.path:
@@ -51,8 +51,8 @@ def main():
     parser.add_argument(
         '--mark_version',
         type=str,
-        default="mark4.7",
-        help="모델 및 데이터셋 버전 (예: mark4.7)"
+        default="mark4.1",
+        help="모델 및 데이터셋 버전 (예: mark4.1)"
     )
     args = parser.parse_args()
 

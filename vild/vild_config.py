@@ -1,11 +1,18 @@
 # vild_config.py
 
+import math
 import torch
 from sentence_transformers import SentenceTransformer
 import os
 
+SHARED_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "shared_vild"))
+if SHARED_DIR not in os.sys.path:
+    os.sys.path.append(SHARED_DIR)
+
+from prompt_bank import get_class_synonyms, get_prompt_templates, get_prompt_texts_for_class
+
 class AudioViLDConfig:
-    def __init__(self, mark_version="mark4.7"):  # change needed
+    def __init__(self, mark_version="mark4.1"):  # change needed
         self.mark_version = mark_version
 
         # === 클래스 설정 ===
@@ -38,7 +45,9 @@ class AudioViLDConfig:
 
         # === 오디오 파라미터 ===
         self.sample_rate = 16000
-        # 세그먼트는 1초 단위로 처리. 파일 전체 길이는 5초(전처리)이나, 세그먼트는 1초 × max_segments 사용.
+        # 세그먼트는 1초 단위로 처리. 전처리(fix_audio_length.py)는 파일을 특정 길이로 강제 통일하지 않고
+        # 최소 3초(=5개 세그먼트를 뽑을 수 있는 최소 길이)만 보장(짧으면 패딩, 길어도 안 자름, mark5와 동일).
+        # 세그먼트는 1초 × max_segments 사용.
         self.segment_duration = 1.0
         self.segment_samples = int(self.sample_rate * self.segment_duration)
 
@@ -53,12 +62,148 @@ class AudioViLDConfig:
 
         # === 모델 파라미터 ===
         self.embedding_dim = 384
-        self.use_background_embedding = True
+        # [확정 2026-07-12] True->False. entropy_threshold 수정 + FSD50K 재분할 이후에도 confusion matrix가
+        # 여전히 완전 붕괴(dog_bark 0/50)했던 진짜 원인. eval.py의 max-override 로직이 학습된 background
+        # embedding을 오디오 임베딩과 비교해 "others" 로짓을 계속 밀어올려서, 실제 dog_bark 샘플에서도
+        # Prob_dog_bark가 0.008~0.016 수준으로 짓눌림(True=others 샘플과 분포가 완전히 겹침). False로 끄자
+        # 즉시 정상적인 confidence 분포(0.257~0.837)가 드러나고 raw accuracy 52%->66%로 개선(코랩 재검증 완료).
+        # 2026-07-11에 한 번 False로 진단했다가 "결과 동일"이라 기각했었는데, 그건 재분할 전 데이터로 학습한
+        # 구모델 기준이었음 - 재분할 후 재학습된 모델에서는 진짜 원인으로 확정됨(가설 재검증의 중요성).
+        self.use_background_embedding = False
+        self.background_embedding_weight = 0.1
+        self.distill_branch_eval_weight = 0.5  # [원복 2026-07-11] 진단(0)했으나 collapse 원인 아님(가설 기각).
+        self.use_text_aligned_student = True
+        self.use_feature_kd = True
+        self.feature_kd_weight = 0.3
+        self.feature_kd_loss_type = "cosine_l1"
+        self.visual_view_type = "mel_delta"
+        self.segment_selection_mode = "salient_topk"
+        self.max_visual_segments = self.max_segments
+        self.logit_temperature = 0.07
+        self.segment_aggregation_mode = "confidence_saliency"  # [원복 2026-07-11] 진단("mean")했으나 collapse 원인 아님(가설 기각).
+        self.segment_confidence_power = 2.0
+        self.segment_saliency_power = 1.0
+        # [조정 2026-07-12] 0.60->0.55. background_embedding override를 끄고 재평가한 실측 confidence
+        # 분포(raw dog_bark 예측 30건: 0.508~0.837) 기준 시뮬레이션 결과, threshold를 0.55까지 낮춰도
+        # others_margin_threshold(0.08, top_conf>=0.54가 사실상의 하한)가 이미 걸러주고 있어 0.55와 0.60
+        # 밑으로는 값을 낮춰도 차이가 없었고, 0.60->0.55 구간에서는 accuracy 0.62->0.63, dog_bark
+        # recall 0.34->0.38로 개선됨(TP=19,FN=31,FP=6,TN=44). 주의: 이 값은 test set(100개) 결과로
+        # 고른 것이라 val set 기준 재검증이 이상적이나, 급한 실전 디버깅 상황이라 우선 반영.
+        self.others_confidence_threshold = 0.55
+        self.others_margin_threshold = 0.08
+        # [확정 2026-07-12] others-calibration override 완전 비활성(False).
+        # 원인: 이 override는 raw 예측이 others가 아닐 때만(=dog_bark일 때만) 작동해서 조건에 걸리면
+        # others로 강등시킨다 -> 구조적으로 dog_bark 예측을 줄이기만 할 뿐 늘리지는 못한다.
+        # mark4.8(2-class specialist) 실측(재분할 재학습 후 test 100개)에서 raw dog_bark recall 62%가
+        # override를 거치면 42%로 반토막났다(정답 dog_bark 10건을 죽이고 오답 11건을 살려 정확도는 +1%p뿐).
+        # 2-class에선 margin=2*conf-1 이라 conf/margin/entropy 세 조건이 전부 conf≈0.55 근처에서 겹쳐,
+        # 그 구간(0.51~0.55)에 정답/오답이 5:5로 섞여 있어 '완화'의 스위트스팟이 없었다(부분완화가 오히려
+        # 더 나빴음). override off 시뮬레이션 결과: dog_bark recall 0.42->0.62, 정확도 0.66->0.65(-1%p),
+        # macro F1 0.639->0.650(오히려 개선). others-calibration은 원래 9-class generalist(mark5)용
+        # 반려 로직이라 2-class specialist에는 부적합. (eval 시점 로직이라 재학습 불필요.)
+        self.use_others_calibration = False
+        # [추가 2026-07-13] 2-class 전용 최종 결정 threshold. 기존에는 argmax(=암묵적 0.5)였음.
+        # 가설 1·2·3·4·6 적용 재학습(커밋 63428a2) 결과 모델이 초보수적으로 변해(dog precision
+        # 1.0, Others FPR 0.0) 놓친 dog 19건 중 11건이 Prob 0.4~0.5 구간에 몰려 있었음.
+        # ROC AUC 0.9192로 분리력이 생긴 상태라 운영점 선택이 가능해짐: threshold를 0.40으로
+        # 낮추면 dog recall 0.62->0.84, accuracy 0.81->0.83, Others FPR 0.00->0.18 (test 100개
+        # 시뮬레이션). 주의: 이 값은 test set으로 고른 것이라 val set 기준 재검증이 이상적임.
+        # 또한 mark4.8 학습 결과 기준이므로 다른 4.x 버전은 각자 재튜닝 필요.
+        # None이면 기존 argmax 동작. 2-class가 아니면 무시됨.
+        # [갱신 2026-07-13] 0.40 -> 0.42. 데이터 증량(train 실데이터 클래스당 436) 재학습 모델에서
+        # val set 스윕(0.30~0.65, 0.01 간격)으로 재선정: val에서 accuracy(0.83)와 macro F1(0.830)
+        # 둘 다 0.42가 최고였음(0.49~0.50도 accuracy 동률이나 dog recall이 낮아 감지 용도상 0.42 채택).
+        # val로 고른 0.42의 test 성능: accuracy 0.85, dog R 0.86, others R 0.84, FPR 0.16.
+        # 이전 0.40은 test로 골랐던 값 -> 이번부터 val 기준 선정으로 절차 개선.
+        # [갱신 2026-07-14] 0.42 -> 0.55. teacher 강화(TeacherAudioEncoder+SpecAugment) 재학습
+        # 모델은 dog confidence 분포가 전체적으로 우측 이동(진짜 dog Prob 중앙값 0.647->0.762)해서
+        # 0.42가 dog 쪽으로 치우친 운영점이 됨(FPR 0.26). 새 모델 val 스윕 결과 0.55~0.57 구간이
+        # 최적 동률(acc 0.81, macroF1 0.810) -> dog recall이 가장 높은 0.55 채택.
+        # val로 고른 0.55의 test 성능: accuracy 0.85, dog R 0.84, others R 0.86, FPR 0.14.
+        # ⚠️ 재학습마다 confidence 분포가 이동하므로, 재학습 후에는 반드시
+        # `eval.py --split val`로 스윕해서 이 값을 재선정할 것(모델-종속 파라미터).
+        # [갱신 2026-07-15] 0.55 -> 0.47. 데이터 정제(1572->1501, 불량 71개 제거) 재학습 모델의
+        # val(99개) 스윕 결과 0.47~0.49가 accuracy 동률(0.818) -> dog recall이 가장 높은 0.47 채택
+        # (감지 용도 기준). val로 고른 0.47의 test(97개) 성능: accuracy 0.866, macro F1 0.866,
+        # dog R 0.84, others R 0.90, FPR 0.104 -> 정제 전(0.85/FPR 0.14)보다 개선.
+        # ⚠️ 위 [갱신 2026-07-13~07-15] 이력은 mark4.8(dog_bark) 계보에서 물려받은 것이다.
+        #    이 파일은 mark4.7(water_shower)용이므로 아래 값만 mark4.7 기준이다.
+        # [갱신 2026-08-01] mark4.7 재학습 후 0.45 -> 0.66 재선정 (water_shower).
+        # val 430개(water_shower 215 / others 215) 전 구간 스윕(0.05~0.95, 0.01 간격) 결과
+        # accuracy 최고는 0.9907이고 0.64 / 0.66 / 0.67 세 지점이 동률이었음.
+        # 그중 0.66을 채택한 근거는 macro F1 6자리 차이가 아니라 운영점 안정성이다:
+        #   0.64      -> 혼동행렬이 유지되는 폭이 0.0066 (경계 표본 0.6342와 0.6408 사이)
+        #   0.66~0.67 -> 폭 0.0225 (경계 표본 0.6514와 0.6739 사이). 3배 넓어 표본 하나에 덜 흔들림.
+        # 0.66 성능: accuracy 0.9907, macro F1 0.9907, water_shower P0.991 R0.991,
+        #            others P0.991 R0.991, others FPR 0.009, TP213/FP2/FN2/TN213.
+        # ⚠️ mark4.8의 0.43과 달리 이번엔 순수 이득이 아니다. 직전 0.45(acc 0.9884) 대비
+        #    오탐은 5->2로 줄지만 미탐이 0->2로 늘어난다(0.45는 recall 1.000이었음).
+        #    accuracy 차이도 430개 중 정확히 1개(425 -> 426)라 통계적 여유는 크지 않다.
+        #    미탐을 절대 허용할 수 없는 운용이면 0.39~0.52 구간(폭 0.139, recall 1.000)이 대안이다.
+        # 재현 검증: 저장된 예측을 thr=0.45로 재계산했을 때 430/430(100%) 일치,
+        #            ROC AUC 자체 계산 0.9994 = 코랩 공식값 0.99944 -> 스윕 결과 신뢰 가능.
+        # val로 고른 0.66의 test(430개) 성능: accuracy 0.9884, macro F1 0.9884, ROC AUC 0.9997,
+        #   water_shower P0.991 R0.986, others P0.986 R0.991, others FPR 0.009, TP212/FP2/FN3/TN213.
+        #   val 0.9907 대비 표본 1개 차이라 과적합 징후 없음 -> val 선정값이 test에서 확인됨.
+        #   (test만으로 다시 고르면 0.37~0.43이 0.9930으로 더 높지만, 2026-07-13에 정한 절차대로
+        #    threshold는 val로만 고르고 test는 확인 용도로만 쓴다.)
+        # 근거 데이터: plots/threshold_sweep_mark4.7_val.csv, plots/threshold_sweep_mark4.7_test.csv
+        #             (model/tune_threshold.py 산출)
+        self.target_decision_threshold = 0.66
+        # [삭제 2026-07-11] others_entropy_threshold 하드코딩(0.72) 제거.
+        # 원인 규명: 2-class(mark4.x) 이진분류에서 정규화 entropy가 0.72 이하가 되려면
+        # top_conf가 최소 약 0.80은 되어야 함(균등분산 최악 케이스 기준 실측 계산).
+        # 반면 confidence_threshold는 0.60으로 설정돼 있어, entropy 조건이 confidence 조건보다
+        # 훨씬 엄격하게 어긋나 있었음 -> confidence>=0.60인 예측도 실제 top_conf가 0.78 정도까지밖에
+        # 안 나오는 mark4.8 실측 분포에서는 entropy 조건에 걸려 100% "others"로 강제 override됨
+        # (confusion matrix가 항상 others로만 나오는 근본 원인이었음).
+        # 아래 property로 대체: confidence_threshold와 "같은 엄격도(같은 top_conf 지점)"가 되도록
+        # 클래스 수 기반으로 자동 역산. mark5(9-class)는 기존 하드코딩값(0.82)이 우연히 이미
+        # confidence_threshold(0.45)와 거의 같은 엄격도였어서(top_conf≈0.47 지점) 이 변경으로도
+        # 동작이 거의 그대로 유지됨. mark4.x는 entropy 조건이 confidence 조건과 정합하게 완화됨.
+        self.explain_topk_segments = 3
+        self.save_visual_explanations = True
 
         # === 학습 파라미터 ===
         self.batch_size = 16
         self.num_epochs = 80 # 100에서 80으로 줄임
         self.learning_rate = 1e-4
+        # [추가 2026-07-12 / 가설6] L2 정규화. 그동안 teacher/student 두 옵티마이저 모두
+        # weight_decay가 전무했음(dropout 0.3만). teacher가 val best를 epoch 5에 찍고 곧장
+        # 과적합으로 넘어가던 실측(train down/val up)에 대한 표준 처방.
+        self.weight_decay = 1e-4
+        # [추가 2026-07-12 / 가설3] teacher CE에 label smoothing. teacher가 약하고 일찍
+        # 과적합하는 문제 완화용. 0이면 기존과 동일 동작.
+        self.teacher_label_smoothing = 0.1
+        # [추가 2026-07-13 / teacher 강화] 그동안 teacher는 student와 완전히 같은 초경량
+        # 인코더(SimpleAudioEncoder, 약 14.3만 파라미터)를 썼음 -> KD인데 teacher의 용량 우위가
+        # 전혀 없어 teacher가 구조적으로 약했음(가장 약한 고리). teacher는 엣지에 배포되지 않고
+        # 오프라인에서 soft label을 만들 때만 쓰이므로 키워도 경량(엣지) 정체성과 무관하며
+        # (profile_efficiency.py도 student만 측정함), "큰 teacher -> 작은 student" 구도가 되어
+        # KD 서사도 강해짐. 근거 실측: 인코더 2블록->3블록 확장 때 teacher val best 0.59->0.52로
+        # teacher 역시 용량이 지배 변수였음.
+        self.use_large_teacher_encoder = True   # False면 기존처럼 student와 같은 인코더 사용
+        # teacher 학습 배치에만 적용하는 SpecAugment(주파수/시간 마스킹). val은 clean 유지.
+        # 작은 데이터(세그먼트 단위)에서 표준적인 과적합 완화책. 마스킹 값은 배치 최솟값(dB 최저=무음).
+        self.teacher_spec_augment = True
+        self.teacher_freq_mask_param = 12       # 최대 마스킹 mel 밴드 폭(전체 64)
+        self.teacher_time_mask_param = 20       # 최대 마스킹 시간 프레임 폭(전체 101)
+        # teacher에도 LR 스케줄 추가(student는 이미 있음). 고정 LR(1e-4)이 val 요동(0.52~0.62)의
+        # 한 원인이었음 -> val loss 정체 시 절반으로 감소.
+        self.teacher_lr_factor = 0.5
+        self.teacher_lr_patience = 3
+        # [추가 2026-07-12 / 가설1] 증류 loss 배분. 기존에는 student_train_distillation.py에
+        # alpha=0.7, T=4.0이 하드코딩되어 있었음. 실측(2026-07-12): soft loss가 0.02 수준으로
+        # 신호가 거의 없는데 총 loss의 70%를 차지해 분류(hard, 30%)가 굶주렸고, 그 결과
+        # train에서조차 hard loss가 랜덤 근처(~0.60, 2-class 랜덤 ln2=0.693)에 고착(분류 과소적합).
+        # alpha를 낮춰 hard에 70%를 배분하고, T도 4.0->2.0으로 낮춰 soft 신호가 덜 뭉개지게 함.
+        # 검증 기준: 재학습 후 train hard loss가 0.6 밑으로 내려가는지 확인.
+        self.distill_alpha = 0.3
+        self.distill_temperature = 2.0
+        # [추가 2026-07-11] teacher_train.py의 EarlyStopping patience가 2로 하드코딩돼 있어
+        # num_epochs=80까지 갈 수 있는데도 val loss가 한 번만 반등해도 5epoch 안에 조기종료되던 버그.
+        # student(student_train_distillation.py의 EarlyStopping)와 동일하게 10으로 통일.
+        self.teacher_patience = 10
 
         self.text_loss_weight = 1.0
         self.image_loss_weight = 1.0
@@ -75,9 +220,14 @@ class AudioViLDConfig:
         # vild/ 기준 상위가 프로젝트 루트라고 가정
         self.project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
         self.audio_dir = os.path.join(self.project_root, "data")  # train/val/test 하위에 존재
+        self.prompt_bank_path = os.path.join(SHARED_DIR, "resources", "prompt_bank.json")
 
         # === 내부 캐시 ===
         self._text_emb = None
+        self._prompt_texts = None
+
+        self.prompt_templates = get_prompt_templates(self.prompt_bank_path)
+        self.class_synonyms = get_class_synonyms(self.prompt_bank_path)
 
     def get_class_index(self, class_name: str) -> int:
         if class_name in self.labeled_classes:
@@ -96,11 +246,53 @@ class AudioViLDConfig:
     def get_target_label_map(self) -> dict:
         return {class_name: i for i, class_name in enumerate(self.get_classes_for_text_prompts())}
 
+    @property
+    def others_entropy_threshold(self) -> float:
+        """
+        [추가 2026-07-11] others_confidence_threshold와 "같은 엄격도(같은 top_conf 지점)"가
+        되도록 클래스 수 기반으로 자동 역산한다. top_conf=confidence_threshold이고 나머지
+        확률이 (클래스수-1)개에 균등분산되는 최악의 경우를 가정해 그때의 정규화 entropy를
+        threshold로 삼는다. 클래스 수가 다른 mark_version 사이에서 entropy 조건이
+        confidence 조건보다 부당하게 엄격/느슨해지는 것을 방지한다.
+        """
+        p = self.others_confidence_threshold
+        n = self.num_distinct_labeled_classes
+        if n <= 1:
+            return 1.0
+        rest = 1.0 - p
+        probs = [p] + [rest / (n - 1)] * (n - 1)
+        entropy = -sum(x * math.log(x, 2) for x in probs if x > 1e-12)
+        return entropy / math.log2(n)
+
+    @property
+    def num_input_channels(self) -> int:
+        if self.visual_view_type == "mel":
+            return 1
+        if self.visual_view_type == "mel_delta":
+            return 3
+        if self.visual_view_type == "mel_energy":
+            return 2
+        return 1
+
+    def get_prompt_texts_for_class(self, class_name: str) -> list:
+        return get_prompt_texts_for_class(class_name, self.prompt_bank_path)
+
+    def get_prompt_texts(self) -> dict:
+        if self._prompt_texts is None:
+            self._prompt_texts = {
+                class_name: self.get_prompt_texts_for_class(class_name)
+                for class_name in self.get_classes_for_text_prompts()
+            }
+        return self._prompt_texts
+
     def get_class_text_embeddings(self) -> torch.Tensor:
         if self._text_emb is None:
-            # 프롬프트 문구는 zero-shot 성능 개선 시 수정 가능
-            prompts = [f"a sound of {c.replace('_', ' ')} in the room" for c in self.get_classes_for_text_prompts()]
             model = SentenceTransformer('all-MiniLM-L6-v2', device=self.device)
-            self._text_emb = model.encode(prompts, convert_to_tensor=True).to(self.device)
+            aggregated = []
+            for class_name in self.get_classes_for_text_prompts():
+                prompts = self.get_prompt_texts_for_class(class_name)
+                emb = model.encode(prompts, convert_to_tensor=True).to(self.device)
+                aggregated.append(emb.mean(dim=0))
+            self._text_emb = torch.stack(aggregated, dim=0)
         return self._text_emb
     

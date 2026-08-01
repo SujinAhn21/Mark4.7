@@ -1,10 +1,11 @@
-# model/eval.py  
+# model/eval.py    
 
 """
 [Deprecated: 평가용 샘플을 per_class_max=30으로 샘플링하던 로직]
 # sampled_files = []; per_class_max = 30; class_counter = defaultdict(int); ...
 """
 import os, sys, csv, glob, torch
+import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import seaborn as sns
 import numpy as np, pandas as pd, argparse
@@ -21,10 +22,14 @@ for p in (PROJECT_ROOT, UTILS_DIR, VILD_DIR):
     if p not in sys.path: sys.path.append(p)
 
 from vild_config import AudioViLDConfig
-from vild_model import SimpleAudioEncoder
-from vild_head import ViLDHead
+from vild_model import SimpleAudioEncoder, ViLDTextHead, LearnableBackgroundEmbedding
+from vild_head import DualBranchStudentHead
 from vild_parser_student import AudioParser
 from seed_utils import set_seed
+SHARED_DIR = os.path.abspath(os.path.join(PROJECT_ROOT, "shared_vild"))
+if SHARED_DIR not in sys.path:
+    sys.path.append(SHARED_DIR)
+from checkpoint_utils import load_checkpoint, resolve_state_dict
 
 def _find_dataset_index(mark_version):
     for p in [os.path.join(PROJECT_ROOT, f"dataset_index_{mark_version}.csv"),
@@ -58,58 +63,327 @@ def _find_student_weights(mark_version):
     hed = next((p for p in head_candidates if os.path.exists(p)), None)
     return enc, hed, enc_candidates, head_candidates
 
-def evaluate(audio_label_list, seed_value=42, mark_version="mark4.7"):
+
+def _compute_segment_saliency(seg_tensor):
+    if seg_tensor.ndim == 4:
+        seg_tensor = seg_tensor.squeeze(0)
+    base = seg_tensor[0] if seg_tensor.ndim == 3 else seg_tensor
+    energy = float(base.abs().mean().item())
+    if base.shape[-1] > 1:
+        flux = float((base[:, 1:] - base[:, :-1]).abs().mean().item())
+    else:
+        flux = 0.0
+    return energy + 0.5 * flux
+
+
+def _aggregate_segment_probs(segment_probs, saliency_scores, config):
+    probs = np.asarray(segment_probs, dtype=np.float32)
+    saliency = np.asarray(saliency_scores, dtype=np.float32)
+    if probs.ndim != 2 or len(probs) == 0:
+        raise ValueError("segment_probs must be a non-empty [K, C] array")
+
+    if config.segment_aggregation_mode == "mean":
+        weights = np.ones(len(probs), dtype=np.float32)
+    else:
+        confidence = probs.max(axis=1)
+        conf_weights = np.power(np.clip(confidence, 1e-6, 1.0), config.segment_confidence_power)
+        saliency_norm = saliency / max(float(saliency.max()), 1e-6)
+        saliency_weights = np.power(np.clip(saliency_norm, 1e-6, 1.0), config.segment_saliency_power)
+        weights = conf_weights * saliency_weights
+
+    weights = weights / max(float(weights.sum()), 1e-6)
+    aggregated = (probs * weights[:, None]).sum(axis=0)
+    return aggregated, weights
+
+
+def _decide_with_threshold(prob_vec, class_names, config):
+    """
+    [추가 2026-07-13] 최종 예측 결정. 2-class(타겟 vs others)에서는 argmax(=암묵적 0.5) 대신
+    config.target_decision_threshold를 쓴다: Prob(타겟) >= threshold면 타겟, 아니면 others.
+    근거: 가설 1·2·3·4·6 재학습 후 모델이 초보수적(dog precision 1.0/FPR 0.0)이 되어 놓친
+    dog 19건 중 11건이 0.4~0.5 구간에 몰림 -> threshold 0.40으로 recall 0.62->0.84 회복
+    (상세는 vild_config.py 주석). threshold가 None이거나 2-class가 아니면 기존 argmax.
+    """
+    thr = getattr(config, "target_decision_threshold", None)
+    if thr is not None and len(class_names) == 2 and "others" in class_names:
+        others_idx = class_names.index("others")
+        target_idx = 1 - others_idx
+        return target_idx if float(prob_vec[target_idx]) >= thr else others_idx
+    return int(np.argmax(prob_vec))
+
+
+def _apply_others_calibration(prob_vec, class_names, config):
+    calibrated = prob_vec.copy()
+    others_idx = class_names.index("others")
+    top_idx = int(np.argmax(calibrated))
+    sorted_idx = np.argsort(calibrated)[::-1]
+    top_conf = float(calibrated[top_idx])
+    second_conf = float(calibrated[sorted_idx[1]]) if len(sorted_idx) > 1 else 0.0
+    margin = top_conf - second_conf
+
+    entropy = float(-(calibrated * np.log(np.clip(calibrated, 1e-8, 1.0))).sum() / np.log(len(class_names)))
+    # [확정 2026-07-12] use_others_calibration=False면 override 자체를 건너뛴다(raw 예측 유지).
+    # mark4.8(2-class)에서 이 override가 dog_bark recall만 깎아(62%->42%) 비활성이 맞다고 실측 확정.
+    force_others = (
+        getattr(config, "use_others_calibration", True)
+        and top_idx != others_idx
+        and (
+            top_conf < config.others_confidence_threshold
+            or margin < config.others_margin_threshold
+            or entropy > config.others_entropy_threshold
+        )
+    )
+    if force_others:
+        boosted = calibrated.copy()
+        boosted[others_idx] = max(boosted[others_idx], top_conf + 1e-3)
+        boosted = boosted / boosted.sum()
+        return boosted, others_idx, {
+            "forced_to_others": True,
+            "raw_top_conf": top_conf,
+            "raw_margin": margin,
+            "entropy": entropy,
+        }
+
+    return calibrated, top_idx, {
+        "forced_to_others": False,
+        "raw_top_conf": top_conf,
+        "raw_margin": margin,
+        "entropy": entropy,
+    }
+
+
+def _save_visual_explanation(path, segments, segment_probs, segment_weights, class_names, final_prob, final_pred, config, plot_dir):
+    if not config.save_visual_explanations:
+        return
+
+    explanation_dir = os.path.join(plot_dir, f"explanations_{config.mark_version}")
+    os.makedirs(explanation_dir, exist_ok=True)
+
+    order = np.argsort(segment_weights)[::-1][:config.explain_topk_segments]
+    fig, axes = plt.subplots(len(order), 1, figsize=(10, 3 * len(order)))
+    if len(order) == 1:
+        axes = [axes]
+
+    for ax, idx in zip(axes, order):
+        seg = segments[idx]
+        if seg.ndim == 4:
+            seg = seg.squeeze(0)
+        base = seg[0].cpu().numpy() if seg.ndim == 3 else seg.cpu().numpy()
+        sns.heatmap(base, ax=ax, cmap="magma", cbar=True)
+        pred_idx = int(np.argmax(segment_probs[idx]))
+        ax.set_title(
+            f"seg#{idx} weight={segment_weights[idx]:.3f} "
+            f"pred={class_names[pred_idx]} conf={segment_probs[idx][pred_idx]:.3f}"
+        )
+        ax.set_xlabel("Time")
+        ax.set_ylabel("Mel")
+
+    fig.suptitle(
+        f"{os.path.basename(path)} | final={class_names[final_pred]} "
+        f"| probs={np.array2string(final_prob, precision=3, suppress_small=True)}",
+        fontsize=10,
+    )
+    fig.tight_layout()
+    out_path = os.path.join(explanation_dir, f"{os.path.splitext(os.path.basename(path))[0]}.png")
+    fig.savefig(out_path)
+    plt.close(fig)
+
+def evaluate(audio_label_list, seed_value=42, mark_version="mark4.1", split="test",
+             profile_latency=False, profile_warmup=10, profile_runs=100):
     set_seed(seed_value)
     config = AudioViLDConfig(mark_version=mark_version)
+    # [추가 2026-07-13] test가 아닌 split(예: val)을 평가할 때는 결과 파일명에 split을 붙여
+    # 기존 test 결과물(confusion matrix, summary CSV 등)을 덮어쓰지 않는다.
+    # 용도: target_decision_threshold 같은 운영점을 test가 아닌 val 기준으로 재검증하기 위함.
+    out_tag = mark_version if split == "test" else f"{mark_version}_{split}"
     parser = AudioParser(config)
     device = config.device
 
-    cls = config.classes; ncls = len(cls)
+    cls = config.get_classes_for_text_prompts(); ncls = len(cls)
     idx2 = {i: l for i,l in enumerate(cls)}
     lab2 = {l: i for i,l in enumerate(cls)}
 
     enc = SimpleAudioEncoder(config).to(device)
-    head= ViLDHead(config.embedding_dim, ncls).to(device)
+    branch_head = DualBranchStudentHead(config.embedding_dim).to(device)
+    head= ViLDTextHead(config).to(device)
+    text_emb = config.get_class_text_embeddings().to(device)
 
     enc_path, head_path, ec, hc = _find_student_weights(mark_version)
     if not enc_path or not head_path:
         print(f"[ERROR] 모델 파일을 찾지 못했습니다.\n  - enc: {ec}\n  - head: {hc}")
         return
-    enc.load_state_dict(torch.load(enc_path, map_location=device))
-    head.load_state_dict(torch.load(head_path, map_location=device))
-    enc.eval(); head.eval()
+    enc_ckpt = load_checkpoint(enc_path, map_location=device)
+    head_ckpt = load_checkpoint(head_path, map_location=device)
+    enc.load_state_dict(resolve_state_dict(enc_ckpt, "model_state_dict", "encoder_state_dict", "model"))
+    branch_head.load_state_dict(resolve_state_dict(head_ckpt, "branch_state_dict", "head_state_dict", "head"), strict=False)
+    enc.eval(); branch_head.eval(); head.eval()
+
+    background_embedding = None
+    if getattr(config, "use_background_embedding", False):
+        # [수정] background_embedding은 head_ckpt(EarlyStopping이 encoder/head와 같은 시점에
+        # 저장한 파일)에서 읽는다. 별도 체크포인트(학습 종료 시점=마지막 epoch)에서 읽으면
+        # early stopping으로 encoder/head가 더 이른 epoch에 고정된 경우 서로 다른 epoch의
+        # 파라미터가 짝지어지는 버그가 생기기 때문.
+        bg_state = head_ckpt.get("background_embedding_state_dict")
+        if bg_state is not None:
+            background_embedding = LearnableBackgroundEmbedding(config.embedding_dim).to(device)
+            background_embedding.load_state_dict(bg_state)
+            background_embedding.eval()
+        else:
+            print(
+                "[WARN] background_embedding_state_dict를 찾지 못했습니다 "
+                f"(checkpoint: {head_path}). 옛 체크포인트로 간주하고 background embedding 보정을 건너뜁니다."
+            )
+
+    def _apply_background_override(logits, features):
+        others_idx = cls.index("others")
+        region_norm = F.normalize(features, dim=1)
+        bg_norm = F.normalize(background_embedding(), dim=0)
+        bg_logit = (region_norm @ bg_norm) / head.temperature
+        logits = logits.clone()
+        logits[:, others_idx] = torch.maximum(logits[:, others_idx], bg_logit)
+        return logits
+
+    # [추가 2026-07-26] 속도 프로파일링 모드: 실제 클립으로 이미지화(load_and_segment) 시간과
+    # 추론(세그먼트 forward + 집계) 시간을 나눠 측정한다. 엣지 배포 타겟이 CPU이므로 CPU 강제.
+    # 정확도 평가는 하지 않고 시간만 잰다(아래 정확도 루프는 건너뜀). mark_version 인자로 Mark5에도 재사용.
+    if profile_latency:
+        import time as _t, json as _json
+        _dev = torch.device("cpu")
+        enc.to(_dev); branch_head.to(_dev); head.to(_dev)
+        _txt = text_emb.to(_dev)
+        _bg = background_embedding.to(_dev) if background_embedding is not None else None
+        _w = getattr(config, "distill_branch_eval_weight", 0.5)
+        img_ms, inf_ms = [], []
+        n_total = min(len(audio_label_list), profile_warmup + profile_runs)
+        print(f"[속도측정] {mark_version}/{split} · CPU · warmup {profile_warmup} + 측정 {max(0, n_total - profile_warmup)}클립")
+        for _i, (_path, _lbl) in enumerate(audio_label_list[:n_total]):
+            _s0 = _t.perf_counter()
+            _segs = parser.load_and_segment(_path)              # ① 이미지화 (파형→mel→세그먼트)
+            _s1 = _t.perf_counter()
+            if not _segs:
+                continue
+            with torch.no_grad():                                # ② 추론 (세그먼트 forward + 집계)
+                _sp, _sal = [], []
+                for _seg in _segs:
+                    if _seg is None or _seg.ndim not in (3, 4): continue
+                    if _seg.ndim == 3: _seg = _seg.unsqueeze(0)
+                    _seg = _seg.to(_dev)
+                    _feat = enc(_seg)
+                    _supf, _disf = branch_head(_feat)
+                    _sl = head(_supf, _txt); _dl = head(_disf, _txt)
+                    if _bg is not None:
+                        _sl = _apply_background_override(_sl, _supf)
+                        _dl = _apply_background_override(_dl, _disf)
+                    _prob = ((1 - _w) * torch.softmax(_sl, dim=-1)
+                             + _w * torch.softmax(_dl, dim=-1)).squeeze(0)
+                    _sp.append(_prob.cpu().numpy())
+                    _sal.append(_compute_segment_saliency(_seg.cpu()))
+                if _sp:
+                    _aggregate_segment_probs(_sp, _sal, config)
+            _s2 = _t.perf_counter()
+            if _i >= profile_warmup:                             # warmup 클립은 통계에서 제외
+                img_ms.append((_s1 - _s0) * 1000.0)
+                inf_ms.append((_s2 - _s1) * 1000.0)
+        if not img_ms:
+            print("[속도측정] 측정된 클립이 없습니다(warmup보다 유효 클립이 적음)."); return
+        _img = np.array(img_ms); _inf = np.array(inf_ms); _tot = _img + _inf
+        _med_tot = float(np.median(_tot))
+        _share = float(np.median(_img) / _med_tot * 100) if _med_tot > 0 else 0.0
+        print("=" * 56)
+        print(f"[속도 프로파일] {mark_version}/{split} · CPU · {len(img_ms)}클립 (warmup {profile_warmup} 제외)")
+        for _name, _a in [("이미지화", _img), ("추론", _inf), ("전체", _tot)]:
+            print(f"  {_name:8s}: 평균 {_a.mean():7.1f} · 중앙 {np.median(_a):7.1f} · 표준편차 {_a.std():6.1f} ms")
+        print(f"  이미지화 비중(중앙값): {_share:.1f}%")
+        print(f"  전체 중앙 {_med_tot:.1f}ms → 1초 이내 실시간: {'예 O' if _med_tot < 1000 else '아니오 X'}")
+        _out = {
+            "mark_version": mark_version, "split": split, "device": "cpu",
+            "n_clips": len(img_ms), "warmup": profile_warmup,
+            "imaging_ms":   {"mean": float(_img.mean()), "median": float(np.median(_img)), "std": float(_img.std())},
+            "inference_ms": {"mean": float(_inf.mean()), "median": float(np.median(_inf)), "std": float(_inf.std())},
+            "total_ms":     {"mean": float(_tot.mean()), "median": _med_tot,               "std": float(_tot.std())},
+            "imaging_share_pct": _share,
+            "realtime_under_1s": bool(_med_tot < 1000),
+        }
+        _pdir = os.path.join(PROJECT_ROOT, "plots"); os.makedirs(_pdir, exist_ok=True)
+        _pjson = os.path.join(_pdir, f"latency_profile_{out_tag}.json")
+        with open(_pjson, "w", encoding="utf-8") as _f:
+            _json.dump(_out, _f, ensure_ascii=False, indent=2)
+        print(f"  저장: {_pjson}")
+        return
 
     y_true, y_pred, y_prob, paths = [], [], [], []
+    raw_y_pred, raw_y_prob = [], []
+    calibration_logs = []
     for path, tlabel in audio_label_list:
         if tlabel not in lab2: continue
         tidx = lab2[tlabel]
         segs = parser.load_and_segment(path)
         if not segs:
             print(f"[INFO] Skip (no valid segments): {os.path.basename(path)}"); continue
-        total = torch.zeros(ncls, device=device); valid=0
+        segment_probs = []
+        saliency_scores = []
         with torch.no_grad():
             for seg in segs:
                 if seg is None or seg.ndim not in (3,4): continue
                 if seg.ndim == 3: seg = seg.unsqueeze(0)
                 seg = seg.to(device)
                 feat = enc(seg)
-                logits = head(feat.flatten(start_dim=1))
-                prob = torch.softmax(logits, dim=-1).squeeze(0)
-                total += prob; valid += 1
-        if valid==0: continue
-        avg = total/valid; pred = int(torch.argmax(avg).item())
-        y_true.append(tidx); y_pred.append(pred); y_prob.append(avg.cpu().numpy()); paths.append(path)
+                supervised_features, distill_features = branch_head(feat)
+                sup_logits = head(supervised_features, text_emb)
+                distill_logits = head(distill_features, text_emb)
+                if background_embedding is not None:
+                    sup_logits = _apply_background_override(sup_logits, supervised_features)
+                    distill_logits = _apply_background_override(distill_logits, distill_features)
+                w = getattr(config, "distill_branch_eval_weight", 0.5)
+                prob = (
+                    (1 - w) * torch.softmax(sup_logits, dim=-1)
+                    + w * torch.softmax(distill_logits, dim=-1)
+                ).squeeze(0)
+                segment_probs.append(prob.cpu().numpy())
+                saliency_scores.append(_compute_segment_saliency(seg.cpu()))
+        if not segment_probs:
+            continue
+
+        aggregated, seg_weights = _aggregate_segment_probs(segment_probs, saliency_scores, config)
+        # [수정 2026-07-13] raw/최종 예측 모두 threshold 결정 적용(기존 argmax).
+        # others-calibration이 개입해 others로 강등한 경우(forced)만 그 결과를 유지한다.
+        raw_pred = _decide_with_threshold(aggregated, cls, config)
+        calibrated_prob, pred, cal_meta = _apply_others_calibration(aggregated, cls, config)
+        if not cal_meta["forced_to_others"]:
+            pred = _decide_with_threshold(calibrated_prob, cls, config)
+
+        y_true.append(tidx)
+        y_pred.append(pred)
+        y_prob.append(calibrated_prob)
+        raw_y_pred.append(raw_pred)
+        raw_y_prob.append(aggregated)
+        calibration_logs.append(cal_meta)
+        paths.append(path)
+
+        _save_visual_explanation(
+            path,
+            segs,
+            segment_probs,
+            seg_weights,
+            cls,
+            calibrated_prob,
+            pred,
+            config,
+            os.path.join(PROJECT_ROOT, "plots"),
+        )
 
     if not y_true:
         print("[WARN] 평가 가능한 예측 없음."); return
 
     y_true = np.array(y_true); y_pred = np.array(y_pred); y_prob = np.array(y_prob)
+    raw_y_pred = np.array(raw_y_pred); raw_y_prob = np.array(raw_y_prob)
     plot_dir = os.path.join(PROJECT_ROOT, "plots"); os.makedirs(plot_dir, exist_ok=True)
 
     cm = confusion_matrix(y_true, y_pred, labels=list(range(ncls)))
     disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=cls)
-    disp.plot(cmap=plt.cm.Blues); plt.title(f"Confusion Matrix ({mark_version})")
-    plt.tight_layout(); plt.savefig(os.path.join(plot_dir, f"confusion_matrix_{mark_version}.png")); plt.close()
+    disp.plot(cmap=plt.cm.Blues); plt.title(f"Confusion Matrix ({out_tag})")
+    plt.tight_layout(); plt.savefig(os.path.join(plot_dir, f"confusion_matrix_{out_tag}.png")); plt.close()
     print("[INFO] Confusion matrix 저장 완료.")
 
     acc = accuracy_score(y_true, y_pred)
@@ -120,8 +394,15 @@ def evaluate(audio_label_list, seed_value=42, mark_version="mark4.7"):
     else:
         rocA = roc_auc_score(y_true, y_prob, multi_class='ovr', average='macro')
 
+    # [추가] others FPR: 실제 라벨이 "others"인데 타겟 클래스로 오분류된 비율 (= 1 - Recall(others)).
+    others_idx = cls.index("others")
+    others_row = cm[others_idx]
+    others_row_sum = int(others_row.sum())
+    others_fpr = float((others_row_sum - others_row[others_idx]) / others_row_sum) if others_row_sum > 0 else float('nan')
+    print(f"[others FPR] 실제 others인데 타겟 클래스로 오분류된 비율: {others_fpr:.4f}")
+
     print("\n" + "="*30)
-    print(f"      성능 평가 결과 ({mark_version})")
+    print(f"      성능 평가 결과 ({out_tag})")
     print("="*30)
     print(f"  - Accuracy: {acc:.4f}")
     if isinstance(rocA, float): print(f"  - ROC AUC: {rocA:.4f}")
@@ -135,8 +416,8 @@ def evaluate(audio_label_list, seed_value=42, mark_version="mark4.7"):
     df.loc['Overall','Accuracy']=acc; df.loc['Overall','ROC AUC']=rocA if isinstance(rocA,float) else None
     plt.figure(figsize=(8,4))
     sns.heatmap(df, annot=True, fmt=".4f", cmap="viridis", cbar=False, linewidths=.5)
-    plt.title(f'Performance Metrics ({mark_version})'); plt.xticks(fontsize=12); plt.yticks(fontsize=12, rotation=0)
-    plt.tight_layout(); plt.savefig(os.path.join(plot_dir, f'performance_metrics_table_{mark_version}.png')); plt.close()
+    plt.title(f'Performance Metrics ({out_tag})'); plt.xticks(fontsize=12); plt.yticks(fontsize=12, rotation=0)
+    plt.tight_layout(); plt.savefig(os.path.join(plot_dir, f'performance_metrics_table_{out_tag}.png')); plt.close()
 
     plt.figure(figsize=(7,6))
     if ncls==2:
@@ -146,53 +427,76 @@ def evaluate(audio_label_list, seed_value=42, mark_version="mark4.7"):
             fpr,tpr,_ = roc_curve(y_true==i, y_prob[:,i]); A = auc(fpr,tpr)
             plt.plot(fpr,tpr, label=f'{cls[i]} AUC={A:.4f}')
     plt.plot([0,1],[0,1],'k--'); plt.xlim([0,1]); plt.ylim([0,1.05])
-    plt.xlabel('FPR'); plt.ylabel('TPR'); plt.title(f'ROC ({mark_version})'); plt.legend(loc="lower right")
-    plt.grid(True); plt.tight_layout(); plt.savefig(os.path.join(plot_dir, f'roc_curve_{mark_version}.png')); plt.close()
+    plt.xlabel('FPR'); plt.ylabel('TPR'); plt.title(f'ROC ({out_tag})'); plt.legend(loc="lower right")
+    plt.grid(True); plt.tight_layout(); plt.savefig(os.path.join(plot_dir, f'roc_curve_{out_tag}.png')); plt.close()
 
-    csv_path = os.path.join(plot_dir, f'performance_summary_{mark_version}.csv')
+    csv_path = os.path.join(plot_dir, f'performance_summary_{out_tag}.csv')
     with open(csv_path, 'w', newline='', encoding='utf-8') as f:
-        f.write(f"# Performance Summary for {mark_version}\n\n")
-        pd.DataFrame({'Metric':['Accuracy','ROC AUC' if ncls==2 else 'ROC AUC (Macro)'],
-                      'Score':[acc, rocA if isinstance(rocA,float) else 'N/A']}).to_csv(f, index=False)
+        f.write(f"# Performance Summary for {out_tag}\n\n")
+        pd.DataFrame({'Metric':['Accuracy','ROC AUC' if ncls==2 else 'ROC AUC (Macro)', 'Others FPR'],
+                      'Score':[acc, rocA if isinstance(rocA,float) else 'N/A', others_fpr]}).to_csv(f, index=False)
         f.write("\n# Class-wise Metrics\n\n")
         pd.DataFrame({'Class':cls,'Precision':pre,'Recall':rec,'F1-Score':f1}).to_csv(f, index=False)
     print(f"[INFO] 성능 요약 CSV 저장: {csv_path}")
 
-    pred_results = os.path.join(plot_dir, f'prediction_details_{mark_version}.csv')
+    pred_results = os.path.join(plot_dir, f'prediction_details_{out_tag}.csv')
     with open(pred_results, 'w', newline='', encoding='utf-8') as f:
         w = csv.writer(f)
-        w.writerow(['Filename','True Label','Predicted Label'] + [f'Prob_{n}' for n in cls])
+        w.writerow([
+            'Filename', 'True Label', 'Raw Predicted Label', 'Predicted Label',
+            'Forced To Others', 'Raw Top Confidence', 'Raw Margin', 'Entropy'
+        ] + [f'Prob_{n}' for n in cls])
         for i in range(len(paths)):
-            w.writerow([os.path.basename(paths[i]), idx2[y_true[i]], idx2[y_pred[i]]] + list(y_prob[i]))
+            meta = calibration_logs[i]
+            w.writerow([
+                os.path.basename(paths[i]),
+                idx2[y_true[i]],
+                idx2[raw_y_pred[i]],
+                idx2[y_pred[i]],
+                meta['forced_to_others'],
+                meta['raw_top_conf'],
+                meta['raw_margin'],
+                meta['entropy'],
+            ] + list(y_prob[i]))
     print(f"[INFO] 상세 예측 결과 CSV 저장: {pred_results}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--mark_version', type=str, default="mark4.7")
+    parser.add_argument('--mark_version', type=str, required=True)
+    # [추가 2026-07-13] 평가 split 선택. 기본은 test(기존 동작 그대로).
+    # val은 target_decision_threshold 같은 운영점을 test가 아닌 데이터로 재검증할 때 쓴다.
+    # split이 test가 아니면 결과 파일명에 _{split}이 붙어 test 결과를 덮지 않는다.
+    parser.add_argument('--split', type=str, default='test', choices=['test', 'val'])
+    # [추가 2026-07-26] 속도 프로파일링 모드: 정확도 대신 이미지화/추론 지연시간(ms/클립)을 CPU에서 측정.
+    parser.add_argument('--profile_latency', action='store_true', help='이미지화+추론 속도만 측정(정확도 스킵)')
+    parser.add_argument('--profile_warmup', type=int, default=10, help='통계에서 제외할 warmup 클립 수')
+    parser.add_argument('--profile_runs', type=int, default=100, help='측정할 클립 수(warmup 제외)')
     args = parser.parse_args()
 
     config = AudioViLDConfig(mark_version=args.mark_version)
     csv_path = _find_dataset_index(args.mark_version)
     pre_parser = AudioParser(config)
 
-    # test 전량 사용, 샘플링 제거
+    # 지정 split 전량 사용, 샘플링 제거
     data = []
     with open(csv_path, newline='', encoding='utf-8') as f:
         for row in csv.DictReader(f):
             p, l = row['path'], row['label']
-            if l in config.classes and ("/data/test/" in p.replace("\\","/")):
+            if l in config.classes and (f"/data/{args.split}/" in p.replace("\\","/")):
                 data.append((p, l))
 
-    print(f"[INFO] test 전량 후보: {len(data)}개. 유효성 검사 후 평가 시작.")
+    print(f"[INFO] {args.split} 전량 후보: {len(data)}개. 유효성 검사 후 평가 시작.")
     valid = []
     for path, label in data:
         segs = pre_parser.load_and_segment(path)
         if segs: valid.append((path, label))
         else: print(f"[WARN] 무효 파일 제외: {os.path.basename(path)}")
 
-    print(f"[INFO] 유효 test 샘플: {len(valid)}개")
+    print(f"[INFO] 유효 {args.split} 샘플: {len(valid)}개")
     if not valid:
-        print("[ERROR] 평가할 유효 test 샘플이 없습니다.")
+        print(f"[ERROR] 평가할 유효 {args.split} 샘플이 없습니다.")
     else:
-        evaluate(valid, seed_value=42, mark_version=args.mark_version)
+        evaluate(valid, seed_value=42, mark_version=args.mark_version, split=args.split,
+                 profile_latency=args.profile_latency,
+                 profile_warmup=args.profile_warmup, profile_runs=args.profile_runs)
     

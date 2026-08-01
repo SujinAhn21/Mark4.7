@@ -44,7 +44,7 @@ def _mirror_save(obj, filename: str):
         with open(t, "wb") as f: pickle.dump(obj, f)
         print(f"[INFO] Saved: {t}")
 
-def extract_hard_labels(mark_version="mark4.7"):
+def extract_hard_labels(mark_version="mark4.1"):
     config = AudioViLDConfig(mark_version=mark_version)
     csv_path = _resolve_csv_path(mark_version)
     parser = AudioParser(config)
@@ -77,7 +77,7 @@ def extract_hard_labels(mark_version="mark4.7"):
 if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser()
-    ap.add_argument('--mark_version', type=str, default="mark4.7")
+    ap.add_argument('--mark_version', type=str, required=True)
     args = ap.parse_args()
     raise SystemExit(extract_hard_labels(args.mark_version))
     

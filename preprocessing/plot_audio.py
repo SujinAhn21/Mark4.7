@@ -1,6 +1,6 @@
 # plot_audio.py
 
-import os
+import os  
 import sys
 import argparse
 import torch
@@ -75,7 +75,7 @@ def plot_mel_spectrogram(waveform, sr, filename, save_dir, config, mark_version)
         print(f"[Error] Mel spectrogram 시각화 실패: {e}")
         return "Mel plot failed"
 
-def plot_waveform_and_mel(path, save_dir=None, seed_value=42, mark_version="mark4.7"):  # change needed
+def plot_waveform_and_mel(path, save_dir=None, seed_value=42, mark_version="mark4.1"):  # change needed
     set_seed(seed_value)
 
     # 저장 경로 설정
@@ -126,7 +126,7 @@ if __name__ == "__main__":
 
     # [변경] mark4.x 구조 대응 + 선택적 인자 처리
     parser = argparse.ArgumentParser()
-    parser.add_argument('--mark_version', type=str, default="mark4.7")
+    parser.add_argument('--mark_version', type=str, required=True)
     parser.add_argument('--path', type=str, default=None, help="시각화할 오디오 파일 경로")
     args = parser.parse_args()
 

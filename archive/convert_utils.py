@@ -7,9 +7,9 @@ from pydub import AudioSegment
 '''colab에는 ffmpeg가 이미 PATH에 있으므로 설정 주석처리'''
 # AudioSegment.converter = "C:/ffmpeg-2025-05-05-git-f4e72eb5a3-full_build/bin/ffmpeg.exe"
 # AudioSegment.ffprobe   = "C:/ffmpeg-2025-05-05-git-f4e72eb5a3-full_build/bin/ffprobe.exe"
-'''colab에서는 gg drive 마운트 후 drive/MyDrive/mark4.7 경로 사용'''
-# input_dir="C:/Users/user/Desktop/AI_model/mark4.7/data"
-# output_dir="C:/Users/user/Desktop/AI_model/mark4.1/data_wav"
+'''colab에서는 gg drive 마운트 후 drive/MyDrive/mark4.1 경로 사용'''
+# input_dir="C:/Users/user/Desktop/AI_model/mark4.1/data"
+# output_dir="C:/Users/user/Desktop/AI_model/mar4.1/data_wav"
 
 def process_audio_files(input_dir="C:/Users/user/Desktop/AI_model/mark2.5.0/data",
                         output_dir="C:/Users/user/Desktop/AI_model/mark2.5.0/data_wav"):

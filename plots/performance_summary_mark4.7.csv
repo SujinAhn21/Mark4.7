@@ -1,11 +1,12 @@
 # Performance Summary for mark4.7
 
 Metric,Score
-Accuracy,1.0
-ROC AUC,1.0
+Accuracy,0.9883720930232558
+ROC AUC,0.9996538669551108
+Others FPR,0.009302325581395349
 
 # Class-wise Metrics
 
 Class,Precision,Recall,F1-Score
-water_shower,1.0,1.0,1.0
-others,1.0,1.0,1.0
+water_shower,0.9906542056074766,0.986046511627907,0.9883449883449883
+others,0.9861111111111112,0.9906976744186047,0.988399071925754

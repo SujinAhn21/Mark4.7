@@ -1,11 +1,11 @@
 [데이터 설명]
 
-◾mark4.1 ~ 4.8
+◾Mark4.1 ~ 4.8
 - Target: 700, Others: 1500 -> 한 클래스 당 2200
 - Train: Target 500, Others 500
 - Validation: Target 100, Others 100
 - Test: Target 100, Others 900 (현실 세계 반영)
-+) mark4.1 ~ Mark4.8 사이에서 Others 데이터 1500개는 공유된다. 세그먼트는 5로 고정한다.
++) Mark4.1 ~ Mark4.8 사이에서 Others 데이터 1500개는 공유된다. 세그먼트는 5로 고정한다.
 
 
 

@@ -3,7 +3,7 @@ import os
 import pickle
 import argparse
 
-def check_soft_label_structure(mark_version="mark4.7"):  # change needed
+def check_soft_label_structure(mark_version="mark4.1"):  # change needed
     pkl_path = f"soft_labels_{mark_version}.pkl"
 
     if not os.path.exists(pkl_path):
@@ -37,7 +37,7 @@ def check_soft_label_structure(mark_version="mark4.7"):  # change needed
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mark_version", type=str, default="mark4.7")  # change needed
+    parser.add_argument("--mark_version", type=str, default="mark4.1")  # change needed
     args = parser.parse_args()
 
     check_soft_label_structure(args.mark_version)

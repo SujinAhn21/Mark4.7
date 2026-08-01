@@ -6,7 +6,6 @@
 """
 import os, sys, pickle, csv, torch, torch.nn.functional as F
 from tqdm import tqdm
-from sentence_transformers import SentenceTransformer
 import argparse
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))        # extraction/
@@ -18,8 +17,12 @@ for p in (PROJECT_ROOT, UTILS_DIR, VILD_DIR, MODEL_DIR):
     if p not in sys.path: sys.path.append(p)
 
 from vild_config import AudioViLDConfig
-from vild_model import SimpleAudioEncoder, ViLDTextHead
+from vild_model import SimpleAudioEncoder, ViLDTextHead, build_teacher_encoder
 from vild_parser_teacher import AudioParser
+SHARED_DIR = os.path.abspath(os.path.join(PROJECT_ROOT, "shared_vild"))
+if SHARED_DIR not in sys.path:
+    sys.path.append(SHARED_DIR)
+from checkpoint_utils import load_checkpoint, resolve_state_dict
 
 def _in_split(path: str, allowed={"train","val"}) -> bool:
     p = path.replace("\\", "/")
@@ -28,7 +31,9 @@ def _in_split(path: str, allowed={"train","val"}) -> bool:
 class TeacherPredictor:
     def __init__(self, config, device):
         self.config, self.device = config, device
-        self.encoder = SimpleAudioEncoder(config).to(device)
+        # [수정 2026-07-13 / teacher 강화] teacher_train.py와 같은 팩토리로 인코더를 만들어야
+        # best_teacher_encoder 체크포인트 구조와 일치한다(대형 teacher 인코더 도입에 따른 변경).
+        self.encoder = build_teacher_encoder(config).to(device)
         self.classifier = ViLDTextHead(config).to(device)
 
         enc_candidates = [
@@ -46,25 +51,25 @@ class TeacherPredictor:
         if enc is None or cls is None:
             raise FileNotFoundError("Teacher weights not found:\n" +
                                     "\n".join(enc_candidates+cls_candidates))
-        self.encoder.load_state_dict(torch.load(enc, map_location=device))
-        self.classifier.load_state_dict(torch.load(cls, map_location=device))
+        enc_ckpt = load_checkpoint(enc, map_location=device)
+        cls_ckpt = load_checkpoint(cls, map_location=device)
+        self.encoder.load_state_dict(resolve_state_dict(enc_ckpt, "model_state_dict", "encoder_state_dict", "model"))
+        self.classifier.load_state_dict(resolve_state_dict(cls_ckpt, "classifier_state_dict", "head_state_dict", "head"))
 
-        text_model = SentenceTransformer('all-MiniLM-L6-v2', device=device)
-        prompts = [f"A sound of {c.replace('_', ' ')} in the room"
-                   for c in config.get_classes_for_text_prompts()]
-        self.text_emb = torch.tensor(text_model.encode(prompts), dtype=torch.float).to(device)
+        self.text_emb = config.get_class_text_embeddings().to(device)
 
         self.encoder.eval(); self.classifier.eval()
 
     @torch.no_grad()
     def predict(self, mel_segments):
-        if not mel_segments: return []
+        if not mel_segments:
+            return [], []
         batch = torch.stack(mel_segments, dim=0).to(self.device)
         region = self.encoder(batch)
         logits = self.classifier(region, self.text_emb)
-        return F.softmax(logits, dim=1).cpu().tolist()
+        return F.softmax(logits, dim=1).cpu().tolist(), region.cpu().tolist()
 
-def extract_soft_labels(mark_version="mark4.7"):
+def extract_soft_labels(mark_version="mark4.1"):
     config = AudioViLDConfig(mark_version=mark_version)
     device = torch.device(config.device)
 
@@ -88,7 +93,12 @@ def extract_soft_labels(mark_version="mark4.7"):
             segs = parser.load_and_segment(path)
             if not segs:
                 print(f"[Warn] No segments: {path}"); continue
-            out.append({"path": path, "soft_labels": teacher.predict(segs)})
+            soft_labels, teacher_features = teacher.predict(segs)
+            out.append({
+                "path": path,
+                "soft_labels": soft_labels,
+                "teacher_features": teacher_features,
+            })
 
     # 저장: 루트/ extraction/ model/ 미러
     name = f"soft_labels_{mark_version}.pkl"
@@ -103,7 +113,7 @@ def extract_soft_labels(mark_version="mark4.7"):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument('--mark_version', type=str, default="mark4.7")
+    ap.add_argument('--mark_version', type=str, required=True)
     args = ap.parse_args()
     raise SystemExit(extract_soft_labels(args.mark_version))
     
